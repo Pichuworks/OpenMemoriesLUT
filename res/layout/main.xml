@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="fill_parent"
+    android:layout_height="fill_parent" >
+
+    <SurfaceView
+        android:id="@+id/surfaceView"
+        android:layout_width="fill_parent"
+        android:layout_height="fill_parent" />
+
+    <!-- 顶部状态条：当前 LUT + 强度 -->
+    <TextView
+        android:id="@+id/topBar"
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#90000000"
+        android:gravity="center"
+        android:padding="6dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="16sp" />
+
+    <!-- 中部 LUT 列表（浏览模式时可见） -->
+    <TextView
+        android:id="@+id/lutList"
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="#B0000000"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.4"
+        android:padding="14dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="18sp"
+        android:visibility="gone" />
+
+    <!-- 底部提示条 -->
+    <TextView
+        android:id="@+id/bottomHint"
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#90000000"
+        android:gravity="center"
+        android:padding="4dp"
+        android:textColor="#FFB0B0B0"
+        android:textSize="11sp" />
+</FrameLayout>
