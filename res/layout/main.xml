@@ -45,4 +45,10 @@
         android:padding="4dp"
         android:textColor="#FFB0B0B0"
         android:textSize="11sp" />
+
+    <!-- AF 对焦框覆盖层（全屏透明，仅对焦时画框） -->
+    <com.sonylut.app.HudView
+        android:id="@+id/hud"
+        android:layout_width="fill_parent"
+        android:layout_height="fill_parent" />
 </FrameLayout>

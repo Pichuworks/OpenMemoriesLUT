@@ -43,7 +43,8 @@ import java.util.Set;
  *   拨轮2              : 强度 0-100%
  *   中央键             : 选定 / 收起列表
  *   删除键             : 关闭 LUT
- *   快门半按/全按      : 对焦 / 拍照（原生管线存储）
+ *   快门半按/全按      : 对焦 / 拍照（原生管线存储）；
+ *                      对焦锁定后再次半按先解锁再重新对焦，取景中央显示对焦框
  *   MENU               : 退出（参数随 App 退出自动还原）
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback,
@@ -60,6 +61,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private static final int SCAN_MENU = 514;
     private static final int SCAN_DELETE = 595;
     private static final int SCAN_S1 = 516;
+    private static final int SCAN_S1_UP = 517;  // 半按释放
     private static final int SCAN_S2 = 518;
     private static final int SCAN_DIAL1_CW = 525;
     private static final int SCAN_DIAL1_CCW = 526;
@@ -70,10 +72,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     private SurfaceHolder surfaceHolder;
     private TextView topBar, lutListView, bottomHint;
+    private HudView hud;
     private CameraEx camera;
     private boolean previewStarted = false;
     private boolean takingPicture = false;
     private boolean resumed = false;
+    // 最近一次 AF 状态（锁定态判断用，v0.2 可重复对焦）
+    private volatile int lastAfStatus = 0;
 
     // LUT 状态
     private final List<File> cubeFiles = new ArrayList<File>();
@@ -113,6 +118,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         topBar = (TextView) findViewById(R.id.topBar);
         lutListView = (TextView) findViewById(R.id.lutList);
         bottomHint = (TextView) findViewById(R.id.bottomHint);
+        hud = (HudView) findViewById(R.id.hud);
         bottomHint.setText("拨轮1:选择  拨轮2:强度  确认:选定  删除:关闭  MENU:退出");
 
         HandlerThread t = new HandlerThread("lut-worker");
@@ -144,6 +150,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         try {
             camera = CameraEx.open(0, null);
             camera.setShutterListener(this);
+            // AF 状态监听：驱动取景中央对焦框。
+            // 回调线程不确定，只打 Log 并切主线程改 UI，不碰 camera native 调用
+            camera.setAutoFocusStartListener(new CameraEx.AutoFocusStartListener() {
+                public void onStart(CameraEx c) {
+                    Log.i(TAG, "af start");
+                    mainHandler.post(new Runnable() {
+                        public void run() {
+                            hud.setAfState(HudView.AF_WORKING);
+                        }
+                    });
+                }
+            });
+            camera.setAutoFocusDoneListener(new CameraEx.AutoFocusDoneListener() {
+                public void onDone(int status, int[] areas, CameraEx c) {
+                    lastAfStatus = status;
+                    Log.i(TAG, "af done: status=" + status);
+                    final int hudState;
+                    if (status == STATUS_LOCK || status == STATUS_LOCK_WARM) {
+                        hudState = HudView.AF_LOCK;
+                    } else if (status == STATUS_WORKING || status == STATUS_CONTINUOUS
+                            || status == STATUS_LOCK_WARN) {
+                        hudState = HudView.AF_WORKING;
+                    } else {
+                        hudState = HudView.AF_CLEAR;
+                    }
+                    mainHandler.post(new Runnable() {
+                        public void run() {
+                            hud.setAfState(hudState);
+                        }
+                    });
+                }
+            });
         } catch (Throwable t) {
             Log.e(TAG, "CameraEx.open failed", t);
             topBar.setText("相机打开失败: " + t);
@@ -175,6 +213,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
         previewStarted = false;
         surfaceHolder.removeCallback(this);
+        lastAfStatus = 0;
+        hud.setAfState(HudView.AF_CLEAR);
         super.onPause();
     }
 
@@ -753,10 +793,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             return true;
         }
         if (scan == SCAN_S1 && camera != null) {
-            try {
-                camera.getNormalCamera().autoFocus(null);
-            } catch (Throwable t) {
-                Log.e(TAG, "autoFocus failed", t);
+            // 实测：HAL 合焦锁定后必须 cancelAutoFocus 才能再次 autoFocus
+            if (lastAfStatus == CameraEx.AutoFocusDoneListener.STATUS_LOCK
+                    || lastAfStatus
+                            == CameraEx.AutoFocusDoneListener.STATUS_LOCK_WARM) {
+                // 锁定态：先 cancel 解锁，200ms 后再重新对焦（立即对焦 HAL 不理）
+                try {
+                    camera.getNormalCamera().cancelAutoFocus();
+                } catch (Throwable t) {
+                    Log.i(TAG, "cancelAutoFocus (pre-S1) failed: " + t);
+                }
+                mainHandler.postDelayed(new Runnable() {
+                    public void run() {
+                        if (camera == null) {
+                            return;
+                        }
+                        try {
+                            camera.getNormalCamera().autoFocus(null);
+                        } catch (Throwable t) {
+                            Log.e(TAG, "autoFocus failed", t);
+                        }
+                    }
+                }, 200);
+            } else {
+                try {
+                    camera.getNormalCamera().autoFocus(null);
+                } catch (Throwable t) {
+                    Log.e(TAG, "autoFocus failed", t);
+                }
+            }
+            return true;
+        }
+        if (scan == SCAN_S1_UP && camera != null) {
+            // 松开半按：仅锁定态才需要 cancelAutoFocus 解锁
+            if (lastAfStatus == CameraEx.AutoFocusDoneListener.STATUS_LOCK
+                    || lastAfStatus
+                            == CameraEx.AutoFocusDoneListener.STATUS_LOCK_WARM) {
+                try {
+                    camera.getNormalCamera().cancelAutoFocus();
+                } catch (Throwable t) {
+                    Log.i(TAG, "cancelAutoFocus (S1-up) failed: " + t);
+                }
             }
             return true;
         }
@@ -801,6 +878,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         int scan = event.getScanCode();
         int code = event.getKeyCode();
         if (scan == SCAN_MENU || scan == SCAN_DELETE || scan == SCAN_S1 || scan == SCAN_S2
+                || scan == SCAN_S1_UP
                 || scan == SCAN_DIAL1_CW || scan == SCAN_DIAL1_CCW
                 || scan == SCAN_DIAL2_CW || scan == SCAN_DIAL2_CCW
                 || scan == SCAN_UP || scan == SCAN_DOWN
