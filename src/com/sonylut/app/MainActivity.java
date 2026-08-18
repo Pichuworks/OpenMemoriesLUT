@@ -18,7 +18,6 @@ import android.widget.TextView;
 import com.sony.scalar.hardware.CameraEx;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -73,12 +72,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private SurfaceHolder surfaceHolder;
     private TextView topBar, lutListView, bottomHint;
     private HudView hud;
-    private CameraEx camera;
+    private volatile CameraEx camera; // shutdown/kick 线程会置换句柄
     private boolean previewStarted = false;
-    private boolean takingPicture = false;
+    private boolean surfaceReady = false; // surfaceCreated/Destroyed 维护，
+                                          // initCamera 靠它决定能否直接 startPreview
+    private volatile boolean takingPicture = false;
     private boolean resumed = false;
+    private volatile boolean pausing = false; // onPause 置位，汇聚器立即停手
     // 最近一次 AF 状态（锁定态判断用，v0.2 可重复对焦）
     private volatile int lastAfStatus = 0;
+
+    // 退出清理线程：onPause 不做任何相机/HAL 调用（2.3 dalvik + 索尼驱动上
+    // UI 线程同步清理会卡死并触发系统看门狗重启拍摄框架），全部丢给它；
+    // finishing 时另有 2.5s 看门狗无条件杀进程兜底
+    private volatile Thread shutdownThread;
+
+    // 取景帧心跳看门狗：startPreview 后 2.5s 无任何帧信号（索尼 Analize 流 /
+    // 一次性预览帧回调）判定黑取景，自动 stop/start 重试 → reopen 逐级自救
+    private volatile boolean previewAlive = false;
+    private int previewKickStage = 0;
+    private int previewNotStartedTicks = 0; // 汇聚器连续「预览未起」计数，≥6 升级 reopen
+    private int cameraNullTicks = 0;        // 汇聚器连续「camera 未开」计数，节流重试
+    private boolean surfaceCbAdded = false; // addCallback 防重复注册
 
     // LUT 状态
     private final List<File> cubeFiles = new ArrayList<File>();
@@ -134,7 +149,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         super.onResume();
         Log.i(TAG, "onResume");
         resumed = true;
+        pausing = false;
         notifyAppInfo();
+        // 取景看门狗布防不依赖 startPreview 成功：预览「从没起来」也能被发现
+        mainHandler.removeCallbacks(previewCheck);
+        mainHandler.postDelayed(previewCheck, 2500);
         if (startupComputing) {
             // 预计算未完成前不进拍照界面
             return;
@@ -144,6 +163,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     /** 打开相机并起预览（可重入）。 */
     private void initCamera() {
+        // 上一次 onPause 的异步清理可能还在跑（快速重进场景）：
+        // 上限 2s 等它释放完相机再开，避免 open 撞上 release
+        Thread sd = shutdownThread;
+        if (sd != null && sd.isAlive()) {
+            Log.i(TAG, "initCamera: join shutdown thread");
+            try {
+                sd.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            Log.i(TAG, "initCamera: shutdown join done, alive=" + sd.isAlive());
+        }
         if (camera != null) {
             return;
         }
@@ -184,13 +215,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             });
         } catch (Throwable t) {
             Log.e(TAG, "CameraEx.open failed", t);
+            prepLog("CameraEx.open failed " + t);
             topBar.setText("相机打开失败: " + t);
             return;
         }
-        surfaceHolder.addCallback(this);
-        if (surfaceHolder.getSurface() != null && surfaceHolder.getSurface().isValid()) {
-            startPreview();
+        if (!surfaceCbAdded) {
+            surfaceHolder.addCallback(this);
+            surfaceCbAdded = true;
         }
+        maybeStartPreview("initCamera");
         refreshTopBar();
         // 恢复之前应用的 LUT（从播放界面返回等场景）
         if (appliedIndex > 0 && baseParams != null) {
@@ -200,29 +233,109 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     @Override
     protected void onPause() {
-        Log.i(TAG, "onPause");
+        final boolean finishing = isFinishing();
+        Log.i(TAG, "onPause finishing=" + finishing);
         resumed = false;
-        if (camera != null) {
-            try {
-                camera.getNormalCamera().stopPreview();
-            } catch (Throwable t) {
-                Log.e(TAG, "stopPreview failed", t);
+        pausing = true; // 让汇聚器立即停手
+        mainHandler.removeCallbacks(previewCheck);
+        // UI 线程不做任何相机/HAL 调用——实测 UI 线程同步清理会死在 onPause
+        // 里，触发索尼系统看门狗重启相机拍摄框架（按 MENU 黑屏重进拍照界面）。
+        // 清管线/stopPreview/release 全部丢给独立 shutdown 线程；finishing 时
+        // 另起 2.5s 看门狗：shutdown 就算卡死在 HAL 里，进程也会被无条件杀掉，
+        // 内核回收 camera fd——用户看到秒退而不是黑屏。
+        final boolean wasPreviewing = previewStarted;
+        Thread t = new Thread("sonylut-shutdown") {
+            public void run() {
+                shutdownCamera(finishing, wasPreviewing);
             }
-            camera.release();
-            camera = null;
+        };
+        shutdownThread = t;
+        t.start();
+        if (finishing) {
+            Thread wd = new Thread("sonylut-exit-watchdog") {
+                public void run() {
+                    try {
+                        Thread.sleep(2500);
+                    } catch (InterruptedException e) {
+                    }
+                    Log.w(TAG, "exit watchdog fired, kill process");
+                    prepLog("exit watchdog fired");
+                    android.os.Process.killProcess(android.os.Process.myPid());
+                    System.exit(0); // killProcess 若未生效的兜底
+                }
+            };
+            wd.setDaemon(true);
+            wd.start();
         }
         previewStarted = false;
         surfaceHolder.removeCallback(this);
+        surfaceCbAdded = false;
         lastAfStatus = 0;
         hud.setAfState(HudView.AF_CLEAR);
         super.onPause();
+        Log.i(TAG, "onPause done (cleanup async)");
+        prepLog("pause dispatched finishing=" + finishing);
+    }
+
+    /** 相机清理（独立 shutdown 线程，可阻塞，finishing 时有看门狗兜底）：
+     *  清管线 → stopPreview → release。exitAfter=true 做完杀进程。 */
+    private void shutdownCamera(boolean exitAfter, boolean wasPreviewing) {
+        long t0 = System.currentTimeMillis();
+        Log.i(TAG, "shutdown begin");
+        prepLog("shutdown begin");
+        // 退出前清掉伽马管线，让机内应用接手时 ISP 是干净状态
+        if (camera != null) {
+            writePipeline(null);
+            Log.i(TAG, "pipeline cleared @shutdown +" + rel(t0) + "ms");
+            if (wasPreviewing) {
+                try {
+                    Log.i(TAG, "stopPreview @shutdown");
+                    camera.getNormalCamera().stopPreview();
+                    Log.i(TAG, "stopPreview done +" + rel(t0) + "ms");
+                } catch (Throwable t) {
+                    Log.e(TAG, "stopPreview failed", t);
+                }
+            }
+            try {
+                Log.i(TAG, "camera release @shutdown");
+                camera.release();
+                Log.i(TAG, "camera release done +" + rel(t0) + "ms");
+            } catch (Throwable t) {
+                Log.e(TAG, "camera release failed", t);
+            }
+            camera = null;
+        }
+        previewStarted = false;
+        Log.i(TAG, "shutdown done +" + rel(t0) + "ms");
+        prepLog("shutdown done " + rel(t0) + "ms");
+        if (exitAfter) {
+            // 204MB 内存设备：彻底杀掉，退出即还内存（原在 onDestroy，
+            // 现在挪到清理完成后；卡死路径由 2.5s 看门狗 killProcess）
+            Log.i(TAG, "process exit");
+            System.exit(0);
+        }
+    }
+
+    private static long rel(long t0) {
+        return System.currentTimeMillis() - t0;
+    }
+
+    @Override
+    protected void onDestroy() {
+        Log.i(TAG, "onDestroy");
+        mainHandler.removeCallbacks(previewCheck); // 摘汇聚器链（onPause 已摘，双保险）
+        super.onDestroy();
+        if (worker != null) {
+            worker.getLooper().quit(); // 队列里残余任务丢弃，别拖累退出
+        }
+        // 注意：这里不 System.exit——进程终止由 shutdown 线程清理完成后
+        // 执行（或其 2.5s 看门狗兜底），onDestroy 只是生命周期过场
     }
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        if (!startupComputing) {
-            startPreview();
-        }
+        surfaceReady = true;
+        maybeStartPreview("surfaceCreated");
     }
 
     @Override
@@ -230,21 +343,244 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        surfaceReady = false;
         previewStarted = false;
     }
 
+    private boolean previewRetried = false;
+
+    /**
+     * 状态汇聚启动预览：只要（预计算完成 ∧ camera 可用）就尝试。surface 就绪
+     * 不信事件接力——surfaceCreated 可能在 addCallback 注册前到达（首次启动
+     * 预计算拖几秒，事件被丢弃，startPreview 被守卫静默吞掉），!surfaceReady
+     * 时直接探测 surface 当前有效性补判定。
+     */
+    private void maybeStartPreview(String why) {
+        if (startupComputing || camera == null || previewStarted) {
+            return;
+        }
+        if (!surfaceReady) {
+            try {
+                android.view.Surface s = surfaceHolder.getSurface();
+                if (s != null && s.isValid()) {
+                    surfaceReady = true;
+                    Log.i(TAG, "surface valid by probe @" + why
+                            + " (surfaceCreated missed)");
+                    prepLog("surface probed valid @" + why);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "surface probe failed: " + t);
+            }
+        }
+        if (!surfaceReady) {
+            Log.w(TAG, "maybeStartPreview(" + why + "): surface not ready");
+            return;
+        }
+        startPreview();
+    }
+
     private void startPreview() {
-        if (camera == null || previewStarted) {
+        if (camera == null || previewStarted || !surfaceReady) {
             return;
         }
         try {
             camera.getNormalCamera().setPreviewDisplay(surfaceHolder);
             camera.getNormalCamera().startPreview();
             previewStarted = true;
+            previewRetried = false;
             Log.i(TAG, "preview started");
-        } catch (IOException e) {
+            prepLog("preview started");
+            armPreviewWatchdog();
+        } catch (Throwable e) {
+            // 首启（预计算后）HAL 可能还没就绪：捕全部异常，800ms 后重试一次
             Log.e(TAG, "startPreview failed", e);
+            prepLog("startPreview failed " + e);
+            if (!previewRetried) {
+                previewRetried = true;
+                mainHandler.postDelayed(new Runnable() {
+                    public void run() {
+                        Log.i(TAG, "startPreview retry");
+                        startPreview();
+                    }
+                }, 800);
+            }
         }
+    }
+
+    // ---------------- 取景帧心跳看门狗（周期性汇聚器，时序竞争免疫） ----------------
+    // 快速重进（进程退出 ~1s 后）索尼驱动偶发「open/startPreview 都成功但无
+    // 画面」；首次启动预计算数秒会把 surfaceCreated 事件丢掉（addCallback 注册
+    // 前到达）。所以不靠一次性事件接力：resumed 期间每 1.5s 自我重排一次，状态
+    // 到哪一步补哪一步——camera null 补 open（节流），预览未起补
+    // maybeStartPreview（连 6 tick 补不动升级 reopen），起了但没帧走 kick 分级
+    // 自救。帧心跳确认（previewAlive）后停表；onPause/onDestroy 摘链。
+
+    /** 帧信号 1：索尼分析数据流。只确认首帧，确认后立刻摘掉，不常驻。 */
+    private final CameraEx.PreviewAnalizeListener analizeListener =
+            new CameraEx.PreviewAnalizeListener() {
+                public void onAnalizedData(CameraEx.AnalizedData d, CameraEx c) {
+                    previewFrameSeen("analize data");
+                }
+            };
+
+    /** 帧信号 2：标准一次性预览帧回调（回调线程 = open 时绑定的主线程）。 */
+    private final Camera.PreviewCallback oneShotFrame = new Camera.PreviewCallback() {
+        public void onPreviewFrame(byte[] data, Camera c) {
+            previewFrameSeen("oneshot frame "
+                    + (data == null ? 0 : data.length) + "B");
+        }
+    };
+
+    private void previewFrameSeen(String via) {
+        if (previewAlive) {
+            return;
+        }
+        previewAlive = true;
+        previewKickStage = 0; // 有帧即痊愈，自救级数归零
+        Log.i(TAG, "preview frames confirmed via " + via);
+        mainHandler.removeCallbacks(previewCheck);
+        // 分析流确认完就摘掉（worker 上摘，失败也无害）
+        worker.post(new Runnable() {
+            public void run() {
+                CameraEx cam = camera;
+                if (cam == null) {
+                    return;
+                }
+                try {
+                    cam.setPreviewAnalizeListener(null);
+                } catch (Throwable t) {
+                }
+            }
+        });
+    }
+
+    private final Runnable previewCheck = new Runnable() {
+        public void run() {
+            if (!resumed || pausing) {
+                return; // 停表：onResume 重新布防
+            }
+            if (startupComputing || takingPicture) {
+                // 预计算/拍照中不判定（帧路径不同），顺延一轮再看——
+                // 注意必须重排保持链存活，预计算可能跑好几秒
+                mainHandler.postDelayed(this, 1500);
+                return;
+            }
+            if (previewAlive) {
+                return; // 帧心跳已确认，停表
+            }
+            if (camera == null) {
+                // initCamera 失败/没跑到：节流重开（每 4 tick ≈ 6s 一次），
+                // 12 tick（~18s）开不起来才放弃提示
+                cameraNullTicks++;
+                if (cameraNullTicks == 1 || cameraNullTicks % 4 == 0) {
+                    Log.w(TAG, "preview tick: camera null (" + cameraNullTicks
+                            + "), initCamera");
+                    prepLog("tick: camera null " + cameraNullTicks);
+                    initCamera();
+                }
+                if (cameraNullTicks >= 12) {
+                    cameraNullTicks = 0;
+                    Log.e(TAG, "preview tick: camera never opened, give up");
+                    prepLog("tick: camera null, gave up");
+                    topBar.setText("相机初始化失败，请退出重进");
+                    return; // 停表
+                }
+                mainHandler.postDelayed(this, 1500);
+                return;
+            }
+            cameraNullTicks = 0;
+            if (!previewStarted) {
+                // 预览从没起来过（无声黑屏）：周期性汇聚，每 tick 补一枪；
+                // 连 6 tick（~9s）补不动升级 reopen 自救
+                previewNotStartedTicks++;
+                Log.w(TAG, "preview tick: not started (" + previewNotStartedTicks
+                        + "), converge");
+                prepLog("tick: preview not started " + previewNotStartedTicks);
+                maybeStartPreview("tick");
+                if (!previewStarted && previewNotStartedTicks >= 6) {
+                    previewNotStartedTicks = 0;
+                    kickPreview(); // kick 内部会重挂链
+                    return;
+                }
+                mainHandler.postDelayed(this, 1500);
+                return;
+            }
+            previewNotStartedTicks = 0;
+            kickPreview(); // 已 start 但无帧：分级自救（kick 内部重挂链）
+        }
+    };
+
+    /** startPreview 成功后挂上：2.5s 无帧信号 → previewCheck 触发自救。 */
+    private void armPreviewWatchdog() {
+        previewAlive = false;
+        try {
+            camera.setPreviewAnalizeListener(analizeListener);
+        } catch (Throwable t) {
+            Log.w(TAG, "analize listener failed: " + t);
+        }
+        try {
+            camera.getNormalCamera().setOneShotPreviewCallback(oneShotFrame);
+        } catch (Throwable t) {
+            Log.w(TAG, "oneshot cb failed: " + t);
+        }
+        mainHandler.removeCallbacks(previewCheck);
+        mainHandler.postDelayed(previewCheck, 2500);
+        Log.i(TAG, "preview watchdog armed");
+    }
+
+    /** 黑取景自救（独立线程，不堵主线程/worker——它们可能正卡在 HAL 里）。 */
+    private void kickPreview() {
+        int st = ++previewKickStage;
+        if (st == 1 && !previewStarted) {
+            // 预览从没起来过：stop/start 无意义，直接升级整只 reopen
+            st = 2;
+            previewKickStage = 2;
+        }
+        final int stage = st;
+        Log.w(TAG, "preview black/stuck, kick stage=" + stage);
+        prepLog("preview kick stage=" + stage);
+        if (stage > 2) {
+            Log.e(TAG, "preview kick gave up");
+            prepLog("preview kick gave up");
+            topBar.setText("取景异常，请退出重进");
+            return;
+        }
+        new Thread("sonylut-preview-kick") {
+            public void run() {
+                if (camera == null || pausing) {
+                    return;
+                }
+                if (stage == 1) { // 只有 previewStarted 才会走到这
+                    try {
+                        Log.i(TAG, "kick: stopPreview");
+                        camera.getNormalCamera().stopPreview();
+                        Thread.sleep(400); // 给驱动一点沉降时间
+                        Log.i(TAG, "kick: startPreview");
+                        camera.getNormalCamera().startPreview();
+                    } catch (Throwable t) {
+                        Log.e(TAG, "kick stage1 failed", t);
+                    }
+                } else {
+                    // stage 2：整只相机 release 后由主线程走 initCamera 重开
+                    try {
+                        camera.release();
+                    } catch (Throwable t) {
+                        Log.e(TAG, "kick release failed", t);
+                    }
+                    camera = null;
+                    Log.i(TAG, "kick: camera released, reopen");
+                }
+                mainHandler.post(new Runnable() {
+                    public void run() {
+                        if (stage == 2) {
+                            initCamera(); // 内部汇聚起预览 → 重新挂看门狗
+                        } else {
+                            armPreviewWatchdog(); // 重挂，仍无帧则升级 stage2
+                        }
+                    }
+                });
+            }
+        }.start();
     }
 
     /** 拍摄类应用注册（LVG 同款）：声明 CATEGORY_REC，快门才归本 App。 */
@@ -256,6 +592,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         intent.putExtra("large_category", "CATEGORY_REC");
         intent.putExtra("small_category", "APP_SHOOTING");
         sendBroadcast(intent);
+    }
+
+    /** 持久化尸检日志：冻机后也能从 SD 卡 PREPLOG.TXT 读出卡在哪一步。 */
+    private static void prepLog(String msg) {
+        try {
+            CACHE_DIR.mkdirs();
+            File f = new File(CACHE_DIR, "PREPLOG.TXT");
+            boolean append = f.isFile() && f.length() <= 65536; // 超 64KB 覆盖重写
+            FileOutputStream fos = new FileOutputStream(f, append);
+            try {
+                fos.write((System.currentTimeMillis() + " " + msg + "\n")
+                        .getBytes("UTF-8"));
+                fos.getFD().sync();
+            } finally {
+                fos.close();
+            }
+        } catch (Throwable t) {
+        }
     }
 
     // ---------------- 启动预计算 ----------------
@@ -628,6 +982,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
             String n = newest.getName().toUpperCase();
             if (n.endsWith(".JPG")) {
+                // 机内写盘慢，等文件写完再动，否则会得到截断 JPEG
+                if (!waitFileStable(newest)) {
+                    Log.w(TAG, "file still growing, give up tagging: "
+                            + newest.getName());
+                    return;
+                }
                 insertJpegComment(newest, "CUSTOM LUT: " + label);
             } else {
                 writeXmpSidecar(newest, "CUSTOM LUT: " + label);
@@ -670,45 +1030,183 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         return newest;
     }
 
-    /** JPEG 字节手术：SOI 后插 COM(FFFE) 段。经 8.3 临时文件替换回原文件。 */
-    private static void insertJpegComment(File jpg, String comment) throws IOException {
-        byte[] data = readAll(jpg);
-        if (data.length < 4
-                || (data[0] & 0xff) != 0xFF || (data[1] & 0xff) != 0xD8) {
-            Log.w(TAG, "not a jpeg: " + jpg.getName());
-            return;
-        }
-        // 已有 COM 标记过就跳过（防重）
-        if ((data[2] & 0xff) == 0xFF && (data[3] & 0xff) == 0xFE) {
-            int len = ((data[4] & 0xff) << 8) | (data[5] & 0xff);
-            if (2 + len <= data.length) {
-                String existing = new String(data, 6, len - 2, "UTF-8");
-                if (existing.startsWith("CUSTOM LUT:")) {
-                    Log.i(TAG, "already tagged, skip");
-                    return;
-                }
+    /** 等文件尺寸稳定：连续两次（间隔 1s）长度一致且 >0 才算写完，最多等 12s。 */
+    private static boolean waitFileStable(File f) {
+        long last = -1;
+        for (int i = 0; i < 12; i++) {
+            long len = f.length();
+            if (len > 0 && len == last) {
+                return true;
             }
+            last = len;
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /** JPEG 字节手术：在 APP0/APP1 段序列之后插 COM(FFFE) 段。
+     *  机内回放的严格解码器要求 SOI 后首个段是 APP0(JFIF)/APP1(EXIF)，
+     *  COM 插在最前面会被拒显（「无法显示」）。全程流式，不整读文件。 */
+    private static void insertJpegComment(File jpg, String comment) throws IOException {
+        // EOI 校验：文件不完整（相机可能还在写）直接放弃本轮
+        if (!checkEoi(jpg)) {
+            Log.w(TAG, "jpeg incomplete (no EOI), skip: " + jpg.getName());
+            return;
         }
         byte[] payload = comment.getBytes("UTF-8");
         if (payload.length > 65530) {
             return;
         }
-        ByteArrayOutputStream out =
-                new ByteArrayOutputStream(data.length + payload.length + 4);
-        out.write(data, 0, 2);
-        out.write(0xFF);
-        out.write(0xFE);
-        int segLen = payload.length + 2; // 长度字段包含自身
-        out.write((segLen >> 8) & 0xff);
-        out.write(segLen & 0xff);
-        out.write(payload);
-        out.write(data, 2, data.length - 2);
-
+        // 第一遍：扫段头，找 APP0/APP1 段序列的结束位置（COM 插入点），顺便防重
+        long insertAt = -1;
+        java.io.BufferedInputStream probe = new java.io.BufferedInputStream(
+                new FileInputStream(jpg), 65536);
+        try {
+            if (probe.read() != 0xFF || probe.read() != 0xD8) {
+                Log.w(TAG, "not a jpeg: " + jpg.getName());
+                return;
+            }
+            long pos = 2; // 已过 SOI
+            while (true) {
+                int m1 = probe.read(), m2 = probe.read();
+                if (m1 < 0 || m2 < 0) {
+                    Log.w(TAG, "jpeg header truncated: " + jpg.getName());
+                    return;
+                }
+                if (m1 != 0xFF || (m2 != 0xE0 && m2 != 0xE1)) {
+                    // 非 APP0/APP1：插入点到了。先看看是不是我们自己的 COM（防重）
+                    if (m1 == 0xFF && m2 == 0xFE) {
+                        int l1 = probe.read(), l2 = probe.read();
+                        int len = (l1 << 8) | l2;
+                        if (len >= 2 && len <= 65535) {
+                            byte[] seg = new byte[len - 2];
+                            int got = 0;
+                            while (got < seg.length) {
+                                int r = probe.read(seg, got, seg.length - got);
+                                if (r < 0) {
+                                    break;
+                                }
+                                got += r;
+                            }
+                            if (got == seg.length && new String(seg, "UTF-8")
+                                    .startsWith("CUSTOM LUT:")) {
+                                Log.i(TAG, "already tagged, skip");
+                                return;
+                            }
+                        }
+                    }
+                    insertAt = pos;
+                    break;
+                }
+                int l1 = probe.read(), l2 = probe.read();
+                if (l1 < 0 || l2 < 0) {
+                    Log.w(TAG, "jpeg header truncated: " + jpg.getName());
+                    return;
+                }
+                int len = (l1 << 8) | l2; // 长度字段含自身 2 字节
+                if (len < 2) {
+                    Log.w(TAG, "bad segment length: " + jpg.getName());
+                    return;
+                }
+                skipFully(probe, len - 2);
+                pos += 2 + len; // 段头 2 字节 + 长度字段与数据
+            }
+        } finally {
+            probe.close();
+        }
+        Log.i(TAG, "jpeg insert at " + insertAt + ": " + jpg.getName());
+        // 第二遍流式重写：SOI + 原 APP0/APP1 段 + COM + 其余部分
         File tmp = new File(jpg.getParentFile(), "LUTTMP.TMP");
-        writeAll(tmp, out.toByteArray());
+        FileInputStream in = new FileInputStream(jpg);
+        FileOutputStream out = new FileOutputStream(tmp);
+        try {
+            copyFully(in, out, insertAt);
+            out.write(0xFF);
+            out.write(0xFE);
+            int segLen = payload.length + 2; // 长度字段包含自身
+            out.write((segLen >> 8) & 0xff);
+            out.write(segLen & 0xff);
+            out.write(payload);
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+        } finally {
+            in.close();
+            out.close();
+        }
+        // tmp 写完再验 EOI，不过则不动原文件
+        if (!checkEoi(tmp)) {
+            tmp.delete();
+            Log.w(TAG, "rewritten jpeg missing EOI, keep original: "
+                    + jpg.getName());
+            return;
+        }
         if (!jpg.delete() || !tmp.renameTo(jpg)) {
             tmp.delete();
             throw new IOException("replace failed: " + jpg.getName());
+        }
+    }
+
+    /** 校验 JPEG 尾部有 EOI(FFD9)（允许尾部零填充）。 */
+    private static boolean checkEoi(File f) {
+        try {
+            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
+            try {
+                long flen = raf.length();
+                if (flen < 4) {
+                    return false;
+                }
+                int tail = (int) Math.min(flen, 65536);
+                byte[] buf = new byte[tail];
+                raf.seek(flen - tail);
+                raf.readFully(buf);
+                int i = tail - 1;
+                while (i >= 0 && buf[i] == 0) {
+                    i--; // 跳过尾部零填充
+                }
+                return i >= 1 && (buf[i] & 0xff) == 0xD9
+                        && (buf[i - 1] & 0xff) == 0xFF;
+            } finally {
+                raf.close();
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 从 in 原样复制 len 字节到 out。 */
+    private static void copyFully(java.io.InputStream in, FileOutputStream out,
+            long len) throws IOException {
+        byte[] buf = new byte[65536];
+        long left = len;
+        while (left > 0) {
+            int n = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (n < 0) {
+                throw new IOException("unexpected EOF during header copy");
+            }
+            out.write(buf, 0, n);
+            left -= n;
+        }
+    }
+
+    /** 流式跳过 len 字节，不足则抛异常。 */
+    private static void skipFully(java.io.InputStream in, long len) throws IOException {
+        long left = len;
+        while (left > 0) {
+            long s = in.skip(left);
+            if (s <= 0) {
+                if (in.read() < 0) {
+                    throw new IOException("unexpected EOF during segment skip");
+                }
+                s = 1;
+            }
+            left -= s;
         }
     }
 
@@ -740,30 +1238,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private static String xmlEscape(String s) {
         return s.replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace("\"", "&quot;");
-    }
-
-    private static byte[] readAll(File f) throws IOException {
-        FileInputStream in = new FileInputStream(f);
-        try {
-            ByteArrayOutputStream out = new ByteArrayOutputStream((int) f.length());
-            byte[] buf = new byte[65536];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-            return out.toByteArray();
-        } finally {
-            in.close();
-        }
-    }
-
-    private static void writeAll(File f, byte[] data) throws IOException {
-        FileOutputStream out = new FileOutputStream(f);
-        try {
-            out.write(data);
-        } finally {
-            out.close();
-        }
     }
 
     // ---------------- 按键 ----------------
