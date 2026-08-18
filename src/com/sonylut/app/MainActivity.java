@@ -28,6 +28,8 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * CUSTOM LUT — A6000 胶片模拟。
@@ -77,6 +79,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private boolean surfaceReady = false; // surfaceCreated/Destroyed 维护，
                                           // initCamera 靠它决定能否直接 startPreview
     private volatile boolean takingPicture = false;
+    // capture 在途闩锁：从按下快门到打标收尾之间置位；期间禁止
+    // stopPreview/release（驱动 drain/写盘未完，强撤会把相机服务 wedge，
+    // Pro 实测 stopPreview 阻塞 2943ms、打标线程与 shutdown 并发）
+    private volatile boolean captureDraining = false;
     private boolean resumed = false;
     private volatile boolean pausing = false; // onPause 置位，汇聚器立即停手
     // 最近一次 AF 状态（锁定态判断用，v0.2 可重复对焦）
@@ -94,6 +100,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private int previewNotStartedTicks = 0; // 汇聚器连续「预览未起」计数，≥6 升级 reopen
     private int cameraNullTicks = 0;        // 汇聚器连续「camera 未开」计数，节流重试
     private boolean surfaceCbAdded = false; // addCallback 防重复注册
+
+    // camera 句柄跨线程互斥（v0.3.1：退出卡几秒的事故——shutdown 线程与其它
+    // 线程并发进 CameraEx HAL native 调用撞车挂起，直到 2.5s 看门狗兜底）。
+    // 所有触碰 camera/HAL 的路径都走它：shutdown/kick 后台线程用 lock() 可等；
+    // 主线程用 tryLock 超时/非阻塞降级（拿不到就跳过本次，绝不阻塞 UI 等锁）。
+    private final ReentrantLock camLock = new ReentrantLock();
 
     // LUT 状态
     private final List<File> cubeFiles = new ArrayList<File>();
@@ -178,7 +190,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         if (camera != null) {
             return;
         }
+        // open 前拿锁：shutdown 线程可能还在做清理（join 只等 2s 上限），
+        // 拿不到就让汇聚器下轮节流重试，别阻塞 UI
+        boolean locked = false;
         try {
+            locked = camLock.tryLock(1000, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!locked) {
+            Log.w(TAG, "initCamera: camLock busy, defer to aggregator");
+            prepLog("initCamera: camLock busy");
+            return;
+        }
+        try {
+            if (camera != null) {
+                return;
+            }
             camera = CameraEx.open(0, null);
             camera.setShutterListener(this);
             // AF 状态监听：驱动取景中央对焦框。
@@ -218,6 +246,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             prepLog("CameraEx.open failed " + t);
             topBar.setText("相机打开失败: " + t);
             return;
+        } finally {
+            camLock.unlock();
         }
         if (!surfaceCbAdded) {
             surfaceHolder.addCallback(this);
@@ -254,9 +284,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         if (finishing) {
             Thread wd = new Thread("sonylut-exit-watchdog") {
                 public void run() {
-                    try {
-                        Thread.sleep(2500);
-                    } catch (InterruptedException e) {
+                    // 顺延式看门狗：正常 shutdown ~300ms，2.5s 内都不算卡；
+                    // 但 capture 在途（drain/写盘/打标收尾）期间不误杀——
+                    // 闩锁置位时每 500ms 醒一次顺延 deadline，硬上限 20s 到点照样杀。
+                    long start = System.currentTimeMillis();
+                    long deadline = start + 2500;
+                    boolean extended = false;
+                    while (true) {
+                        long now = System.currentTimeMillis();
+                        if (now >= deadline || now >= start + 20000) {
+                            break;
+                        }
+                        if (captureDraining) {
+                            if (!extended) {
+                                extended = true;
+                                Log.i(TAG, "exit watchdog: capture draining, extend");
+                                prepLog("watchdog extend (capture draining)");
+                            }
+                            deadline = now + 2500;
+                        }
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
                     }
                     Log.w(TAG, "exit watchdog fired, kill process");
                     prepLog("exit watchdog fired");
@@ -278,32 +329,61 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     }
 
     /** 相机清理（独立 shutdown 线程，可阻塞，finishing 时有看门狗兜底）：
-     *  清管线 → stopPreview → release。exitAfter=true 做完杀进程。 */
+     *  清管线 → stopPreview → release。exitAfter=true 做完杀进程。
+     *  全程持 camLock，与其它线程的 HAL 调用互斥（v0.3.1 退出卡几秒事故）。 */
     private void shutdownCamera(boolean exitAfter, boolean wasPreviewing) {
         long t0 = System.currentTimeMillis();
         Log.i(TAG, "shutdown begin");
         prepLog("shutdown begin");
-        // 退出前清掉伽马管线，让机内应用接手时 ISP 是干净状态
-        if (camera != null) {
-            writePipeline(null);
-            Log.i(TAG, "pipeline cleared @shutdown +" + rel(t0) + "ms");
-            if (wasPreviewing) {
-                try {
-                    Log.i(TAG, "stopPreview @shutdown");
-                    camera.getNormalCamera().stopPreview();
-                    Log.i(TAG, "stopPreview done +" + rel(t0) + "ms");
-                } catch (Throwable t) {
-                    Log.e(TAG, "stopPreview failed", t);
-                }
-            }
+        // capture 在途闩锁：拍照后立刻 MENU 退出时，驱动 drain/写盘/打标可能
+        // 未完，此时 stopPreview+release 会 wedge 相机服务（Pro 实测 stopPreview
+        // 阻塞 2943ms）。有界等待 ≤12s 让闩锁先清空，超时照常走（看门狗顺延兜底）。
+        long w0 = System.currentTimeMillis();
+        while (captureDraining && System.currentTimeMillis() - w0 < 12000) {
+            Log.i(TAG, "waiting capture drain +" + rel(w0) + "ms");
+            prepLog("waiting capture drain " + rel(w0) + "ms");
             try {
-                Log.i(TAG, "camera release @shutdown");
-                camera.release();
-                Log.i(TAG, "camera release done +" + rel(t0) + "ms");
-            } catch (Throwable t) {
-                Log.e(TAG, "camera release failed", t);
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                break;
             }
-            camera = null;
+        }
+        if (captureDraining) {
+            Log.e(TAG, "capture drain timeout 12s, proceed anyway");
+            prepLog("capture drain TIMEOUT");
+        } else if (System.currentTimeMillis() - w0 > 0) {
+            Log.i(TAG, "capture drain done +" + rel(w0) + "ms");
+            prepLog("capture drain done " + rel(w0) + "ms");
+        }
+        prepLog("shutdown lock wait begin");
+        camLock.lock(); // 后台线程可等；卡死由 2.5s 看门狗/进程退出兜底
+        prepLog("shutdown lock acquired +" + rel(t0) + "ms");
+        try {
+            // 退出前清掉伽马管线，让机内应用接手时 ISP 是干净状态。
+            // writePipeline 内部会再拿 camLock——ReentrantLock 可重入，安全。
+            if (camera != null) {
+                writePipeline(null);
+                Log.i(TAG, "pipeline cleared @shutdown +" + rel(t0) + "ms");
+                if (wasPreviewing) {
+                    try {
+                        Log.i(TAG, "stopPreview @shutdown");
+                        camera.getNormalCamera().stopPreview();
+                        Log.i(TAG, "stopPreview done +" + rel(t0) + "ms");
+                    } catch (Throwable t) {
+                        Log.e(TAG, "stopPreview failed", t);
+                    }
+                }
+                try {
+                    Log.i(TAG, "camera release @shutdown");
+                    camera.release();
+                    Log.i(TAG, "camera release done +" + rel(t0) + "ms");
+                } catch (Throwable t) {
+                    Log.e(TAG, "camera release failed", t);
+                }
+                camera = null;
+            }
+        } finally {
+            camLock.unlock();
         }
         previewStarted = false;
         Log.i(TAG, "shutdown done +" + rel(t0) + "ms");
@@ -380,10 +460,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     }
 
     private void startPreview() {
-        if (camera == null || previewStarted || !surfaceReady) {
+        if (camera == null || previewStarted || !surfaceReady || pausing) {
+            return;
+        }
+        if (!camLock.tryLock()) {
+            // shutdown/kick 持锁中：跳过本次，汇聚器下轮会再补
+            Log.w(TAG, "startPreview: camLock busy, skip");
             return;
         }
         try {
+            if (camera == null || previewStarted || pausing) {
+                return;
+            }
             camera.getNormalCamera().setPreviewDisplay(surfaceHolder);
             camera.getNormalCamera().startPreview();
             previewStarted = true;
@@ -404,6 +492,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     }
                 }, 800);
             }
+        } finally {
+            camLock.unlock();
         }
     }
 
@@ -439,16 +529,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         previewKickStage = 0; // 有帧即痊愈，自救级数归零
         Log.i(TAG, "preview frames confirmed via " + via);
         mainHandler.removeCallbacks(previewCheck);
-        // 分析流确认完就摘掉（worker 上摘，失败也无害）
+        // 分析流确认完就摘掉（worker 上摘，拿不到锁就算了，留着也无害）
         worker.post(new Runnable() {
             public void run() {
                 CameraEx cam = camera;
-                if (cam == null) {
+                if (cam == null || !camLock.tryLock()) {
                     return;
                 }
                 try {
                     cam.setPreviewAnalizeListener(null);
                 } catch (Throwable t) {
+                } finally {
+                    camLock.unlock();
                 }
             }
         });
@@ -513,15 +605,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     /** startPreview 成功后挂上：2.5s 无帧信号 → previewCheck 触发自救。 */
     private void armPreviewWatchdog() {
         previewAlive = false;
-        try {
-            camera.setPreviewAnalizeListener(analizeListener);
-        } catch (Throwable t) {
-            Log.w(TAG, "analize listener failed: " + t);
-        }
-        try {
-            camera.getNormalCamera().setOneShotPreviewCallback(oneShotFrame);
-        } catch (Throwable t) {
-            Log.w(TAG, "oneshot cb failed: " + t);
+        // 帧信号监听挂接进 HAL，走锁；startPreview 持锁调用时重入无碍，
+        // kick 完成后主线程重挂时可能撞上 shutdown——拿不到就跳过，
+        // 链仍然重排，下轮 tick 会再汇聚
+        if (camLock.tryLock()) {
+            try {
+                if (camera != null && !pausing) {
+                    try {
+                        camera.setPreviewAnalizeListener(analizeListener);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "analize listener failed: " + t);
+                    }
+                    try {
+                        camera.getNormalCamera()
+                                .setOneShotPreviewCallback(oneShotFrame);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "oneshot cb failed: " + t);
+                    }
+                }
+            } finally {
+                camLock.unlock();
+            }
+        } else {
+            Log.w(TAG, "armPreviewWatchdog: camLock busy, listeners skipped");
         }
         mainHandler.removeCallbacks(previewCheck);
         mainHandler.postDelayed(previewCheck, 2500);
@@ -547,28 +653,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
         new Thread("sonylut-preview-kick") {
             public void run() {
-                if (camera == null || pausing) {
-                    return;
-                }
-                if (stage == 1) { // 只有 previewStarted 才会走到这
-                    try {
-                        Log.i(TAG, "kick: stopPreview");
-                        camera.getNormalCamera().stopPreview();
-                        Thread.sleep(400); // 给驱动一点沉降时间
-                        Log.i(TAG, "kick: startPreview");
-                        camera.getNormalCamera().startPreview();
-                    } catch (Throwable t) {
-                        Log.e(TAG, "kick stage1 failed", t);
+                camLock.lock(); // 后台线程可等；与 shutdown 互斥，防并发进 HAL
+                try {
+                    if (camera == null || pausing) {
+                        return;
                     }
-                } else {
-                    // stage 2：整只相机 release 后由主线程走 initCamera 重开
-                    try {
-                        camera.release();
-                    } catch (Throwable t) {
-                        Log.e(TAG, "kick release failed", t);
+                    if (stage == 1) { // 只有 previewStarted 才会走到这
+                        try {
+                            Log.i(TAG, "kick: stopPreview");
+                            camera.getNormalCamera().stopPreview();
+                            Thread.sleep(400); // 给驱动一点沉降时间
+                            Log.i(TAG, "kick: startPreview");
+                            camera.getNormalCamera().startPreview();
+                        } catch (Throwable t) {
+                            Log.e(TAG, "kick stage1 failed", t);
+                        }
+                    } else {
+                        // stage 2：整只相机 release 后由主线程走 initCamera 重开
+                        try {
+                            camera.release();
+                        } catch (Throwable t) {
+                            Log.e(TAG, "kick release failed", t);
+                        }
+                        camera = null;
+                        Log.i(TAG, "kick: camera released, reopen");
                     }
-                    camera = null;
-                    Log.i(TAG, "kick: camera released, reopen");
+                } finally {
+                    camLock.unlock();
                 }
                 mainHandler.post(new Runnable() {
                     public void run() {
@@ -879,33 +990,46 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         return sb.length() > 0 ? sb.toString() : "LUT";
     }
 
-    /** 写管线（主线程）。params=null 表示关闭。 */
+    /** 写管线（主线程）。params=null 表示关闭。持 camLock 与 shutdown/kick 互斥。 */
     private void writePipeline(LutParams params) {
         if (camera == null) {
             return;
         }
+        // 退出中不再写新参数（shutdown 会统一清管线），尽快放锁别挡 shutdown
+        if (pausing && params != null) {
+            Log.i(TAG, "writePipeline skipped (pausing)");
+            return;
+        }
+        camLock.lock();
         try {
-            if (params == null) {
-                camera.setExtendedGammaTable(null);
-                writeMatrix(new int[]{1024, 0, 0, 0, 1024, 0, 0, 0, 1024});
-                Log.i(TAG, "pipeline cleared");
+            if (camera == null) {
                 return;
             }
-            CameraEx.GammaTable table = camera.createGammaTable();
-            table.setPictureEffectGammaForceOff(true);
-            byte[] buf = new byte[2048];
-            for (int i = 0; i < 1024; i++) {
-                int v = params.gamma[i];
-                buf[2 * i] = (byte) (v & 0xff);
-                buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
+            try {
+                if (params == null) {
+                    camera.setExtendedGammaTable(null);
+                    writeMatrix(new int[]{1024, 0, 0, 0, 1024, 0, 0, 0, 1024});
+                    Log.i(TAG, "pipeline cleared");
+                    return;
+                }
+                CameraEx.GammaTable table = camera.createGammaTable();
+                table.setPictureEffectGammaForceOff(true);
+                byte[] buf = new byte[2048];
+                for (int i = 0; i < 1024; i++) {
+                    int v = params.gamma[i];
+                    buf[2 * i] = (byte) (v & 0xff);
+                    buf[2 * i + 1] = (byte) ((v >> 8) & 0xff);
+                }
+                table.write(new ByteArrayInputStream(buf));
+                camera.setExtendedGammaTable(table);
+                writeMatrix(params.matrix);
+                Log.i(TAG, "pipeline written");
+            } catch (Throwable t) {
+                Log.e(TAG, "writePipeline failed", t);
+                topBar.setText("写入失败: " + t);
             }
-            table.write(new ByteArrayInputStream(buf));
-            camera.setExtendedGammaTable(table);
-            writeMatrix(params.matrix);
-            Log.i(TAG, "pipeline written");
-        } catch (Throwable t) {
-            Log.e(TAG, "writePipeline failed", t);
-            topBar.setText("写入失败: " + t);
+        } finally {
+            camLock.unlock();
         }
     }
 
@@ -926,28 +1050,80 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     // ---------------- 拍照 ----------------
 
+    /** 闩锁兜底：onShutter 丢失（HAL 异常等）时 30s 后强制复位，
+     *  否则 shutdown 会被有界等待卡满 12s、看门狗顺延到 20s 上限。 */
+    private final Runnable captureDrainSafety = new Runnable() {
+        public void run() {
+            if (captureDraining) {
+                captureDraining = false;
+                Log.e(TAG, "capture drain safety clear (30s, onShutter lost?)");
+                prepLog("capture drain safety clear");
+            }
+        }
+    };
+
+    /** 闩锁复位（幂等），在打标任务之后由 worker 串行触发。 */
+    private void endCaptureDrain(String via) {
+        if (captureDraining) {
+            captureDraining = false;
+            Log.i(TAG, "capture drain end (" + via + ")");
+            prepLog("capture drain end " + via);
+        }
+    }
+
     private void shoot() {
-        if (camera == null || takingPicture) {
+        if (camera == null || takingPicture || pausing) {
+            return;
+        }
+        if (!camLock.tryLock()) {
+            // 锁被占（kicked/shutdown/写管线中）：跳过本次快门，绝不阻塞 UI
+            Log.w(TAG, "shoot: camLock busy, skip");
             return;
         }
         try {
+            if (camera == null || pausing) {
+                return;
+            }
             takingPicture = true;
+            captureDraining = true;
+            Log.i(TAG, "capture drain begin (shutter)");
+            prepLog("capture drain begin");
             camera.burstableTakePicture();
+            // 兜底闩锁挂在主线程：拍成功则 onShutter 链路复位，这里摘掉重挂
+            mainHandler.removeCallbacks(captureDrainSafety);
+            mainHandler.postDelayed(captureDrainSafety, 30000);
         } catch (Throwable t) {
             takingPicture = false;
+            captureDraining = false;
             Log.e(TAG, "burstableTakePicture failed", t);
+        } finally {
+            camLock.unlock();
         }
     }
 
     @Override
     public void onShutter(int i, CameraEx cameraEx) {
-        try {
-            cameraEx.cancelTakePicture();
-        } catch (Throwable t) {
-            Log.e(TAG, "cancelTakePicture failed", t);
+        // 回调线程不确定：拿不到锁就跳过 cancel（shutdown 会整体 release）
+        if (camLock.tryLock()) {
+            try {
+                cameraEx.cancelTakePicture();
+            } catch (Throwable t) {
+                Log.e(TAG, "cancelTakePicture failed", t);
+            } finally {
+                camLock.unlock();
+            }
+        } else {
+            Log.w(TAG, "onShutter: camLock busy, cancel skipped");
         }
         takingPicture = false;
         scheduleTagging();
+        // 1600 > 打标的 1500：worker 串行队列保证这条排在打标任务之后，
+        // 即打标收尾（含等文件稳定最多 12s + 写 JPEG COM 段）完了闩锁才复位
+        worker.postDelayed(new Runnable() {
+            public void run() {
+                endCaptureDrain("tagWorker tail");
+            }
+        }, 1600);
     }
 
     // ---------------- 成片 LUT 标记 ----------------
@@ -1267,34 +1443,51 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             return true;
         }
         if (scan == SCAN_S1 && camera != null) {
-            // 实测：HAL 合焦锁定后必须 cancelAutoFocus 才能再次 autoFocus
-            if (lastAfStatus == CameraEx.AutoFocusDoneListener.STATUS_LOCK
-                    || lastAfStatus
-                            == CameraEx.AutoFocusDoneListener.STATUS_LOCK_WARM) {
-                // 锁定态：先 cancel 解锁，200ms 后再重新对焦（立即对焦 HAL 不理）
-                try {
-                    camera.getNormalCamera().cancelAutoFocus();
-                } catch (Throwable t) {
-                    Log.i(TAG, "cancelAutoFocus (pre-S1) failed: " + t);
+            // AF 进 HAL 要持 camLock；拿不到（写管线/kick/shutdown 中）就跳过本次，
+            // 绝不阻塞 UI 等锁（Pro 同款策略：拿不到就跳键）
+            if (!camLock.tryLock()) {
+                Log.w(TAG, "S1: camLock busy, skip AF");
+                return true;
+            }
+            try {
+                if (camera == null || pausing) {
+                    return true;
                 }
-                mainHandler.postDelayed(new Runnable() {
-                    public void run() {
-                        if (camera == null) {
-                            return;
-                        }
-                        try {
-                            camera.getNormalCamera().autoFocus(null);
-                        } catch (Throwable t) {
-                            Log.e(TAG, "autoFocus failed", t);
-                        }
+                // 实测：HAL 合焦锁定后必须 cancelAutoFocus 才能再次 autoFocus
+                if (lastAfStatus == CameraEx.AutoFocusDoneListener.STATUS_LOCK
+                        || lastAfStatus
+                                == CameraEx.AutoFocusDoneListener.STATUS_LOCK_WARM) {
+                    // 锁定态：先 cancel 解锁，200ms 后再重新对焦（立即对焦 HAL 不理）
+                    try {
+                        camera.getNormalCamera().cancelAutoFocus();
+                    } catch (Throwable t) {
+                        Log.i(TAG, "cancelAutoFocus (pre-S1) failed: " + t);
                     }
-                }, 200);
-            } else {
-                try {
-                    camera.getNormalCamera().autoFocus(null);
-                } catch (Throwable t) {
-                    Log.e(TAG, "autoFocus failed", t);
+                    mainHandler.postDelayed(new Runnable() {
+                        public void run() {
+                            if (camera == null || pausing || !camLock.tryLock()) {
+                                return;
+                            }
+                            try {
+                                if (camera != null) {
+                                    camera.getNormalCamera().autoFocus(null);
+                                }
+                            } catch (Throwable t) {
+                                Log.e(TAG, "autoFocus failed", t);
+                            } finally {
+                                camLock.unlock();
+                            }
+                        }
+                    }, 200);
+                } else {
+                    try {
+                        camera.getNormalCamera().autoFocus(null);
+                    } catch (Throwable t) {
+                        Log.e(TAG, "autoFocus failed", t);
+                    }
                 }
+            } finally {
+                camLock.unlock();
             }
             return true;
         }
@@ -1303,10 +1496,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             if (lastAfStatus == CameraEx.AutoFocusDoneListener.STATUS_LOCK
                     || lastAfStatus
                             == CameraEx.AutoFocusDoneListener.STATUS_LOCK_WARM) {
+                if (!camLock.tryLock()) {
+                    Log.w(TAG, "S1-up: camLock busy, skip cancel");
+                    return true;
+                }
                 try {
-                    camera.getNormalCamera().cancelAutoFocus();
+                    if (camera != null) {
+                        camera.getNormalCamera().cancelAutoFocus();
+                    }
                 } catch (Throwable t) {
                     Log.i(TAG, "cancelAutoFocus (S1-up) failed: " + t);
+                } finally {
+                    camLock.unlock();
                 }
             }
             return true;
